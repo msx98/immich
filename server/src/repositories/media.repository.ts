@@ -2,13 +2,12 @@ import { Injectable } from '@nestjs/common';
 import { ExifDateTime, exiftool, WriteTags } from 'exiftool-vendored';
 import ffmpeg, { FfprobeData } from 'fluent-ffmpeg';
 import { Duration } from 'luxon';
+import { fork } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
-import sharp from 'sharp';
-import { ORIENTATION_TO_SHARP_ROTATION } from 'src/constants';
 import { Exif } from 'src/database';
-import { AssetEditActionItem } from 'src/dtos/editing.dto';
-import { Colorspace, LogLevel, RawExtractedFormat } from 'src/enum';
+import { LogLevel, RawExtractedFormat } from 'src/enum';
 import { LoggingRepository } from 'src/repositories/logging.repository';
 import {
   DecodeToBufferOptions,
@@ -20,14 +19,11 @@ import {
   VideoInfo,
 } from 'src/types';
 import { handlePromiseError } from 'src/utils/misc';
-import { createAffineMatrix } from 'src/utils/transform';
 
 const probe = (input: string, options: string[]): Promise<FfprobeData> =>
   new Promise((resolve, reject) =>
     ffmpeg.ffprobe(input, options, (error, data) => (error ? reject(error) : resolve(data))),
   );
-sharp.concurrency(0);
-sharp.cache({ files: 0 });
 
 type ProgressEvent = {
   frames: number;
@@ -42,6 +38,50 @@ export type ExtractResult = {
   buffer: Buffer;
   format: RawExtractedFormat;
 };
+
+type GenerateThumbnailMessage = {
+  operation: 'generateThumbnail';
+  input: { type: 'path'; value: string } | { type: 'buffer'; value: string };
+  options: GenerateThumbnailOptions;
+  output: string;
+};
+
+type GenerateThumbnailResponse = { ok: true } | { ok: false; error: string };
+
+type DecodeImageMessage = {
+  operation: 'decodeImage';
+  input: { type: 'path'; value: string } | { type: 'buffer'; value: string };
+  options: DecodeToBufferOptions;
+};
+
+type DecodeImageResponse =
+  | {
+    ok: true;
+    data: string;
+    info: {
+      width: number;
+      height: number;
+      channels: 1 | 2 | 3 | 4;
+    };
+  }
+  | { ok: false; error: string };
+
+type GenerateThumbhashMessage = {
+  operation: 'generateThumbhash';
+  input: { type: 'path'; value: string } | { type: 'buffer'; value: string };
+  options: GenerateThumbhashOptions;
+};
+
+type GenerateThumbhashResponse = { ok: true; data: string } | { ok: false; error: string };
+
+type GetImageMetadataMessage = {
+  operation: 'getImageMetadata';
+  input: { type: 'path'; value: string } | { type: 'buffer'; value: string };
+};
+
+type GetImageMetadataResponse =
+  | { ok: true; width: number; height: number; isTransparent: boolean }
+  | { ok: false; error: string };
 
 @Injectable()
 export class MediaRepository {
@@ -141,96 +181,231 @@ export class MediaRepository {
   }
 
   async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    const pipeline = await this.getImageDecodingPipeline(input, options);
-    return pipeline.raw().toBuffer({ resolveWithObject: true });
-  }
+    const message: DecodeImageMessage = {
+      operation: 'decodeImage',
+      input: typeof input === 'string' ? { type: 'path', value: input } : { type: 'buffer', value: input.toString('base64') },
+      options,
+    };
 
-  private async applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): Promise<sharp.Sharp> {
-    const affineEditOperations = edits.filter((edit) => edit.action !== 'crop');
-    const matrix = createAffineMatrix(affineEditOperations);
-
-    const crop = edits.find((edit) => edit.action === 'crop');
-    const dimensions = await pipeline.metadata();
-
-    if (crop) {
-      pipeline = pipeline.extract({
-        left: crop ? Math.round(crop.parameters.x) : 0,
-        top: crop ? Math.round(crop.parameters.y) : 0,
-        width: crop ? Math.round(crop.parameters.width) : dimensions.width || 0,
-        height: crop ? Math.round(crop.parameters.height) : dimensions.height || 0,
-      });
-    }
-
-    const { a, b, c, d } = matrix;
-    pipeline = pipeline.affine([
-      [a, b],
-      [c, d],
-    ]);
-
-    return pipeline;
+    const response = await this.runDecodeImageProcess(message);
+    return {
+      data: Buffer.from(response.data, 'base64'),
+      info: response.info,
+    };
   }
 
   async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    const pipeline = await this.getImageDecodingPipeline(input, options);
-    const decoded = pipeline.toFormat(options.format, {
-      quality: options.quality,
-      // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
-      chromaSubsampling: options.quality >= 80 ? '4:4:4' : '4:2:0',
-      progressive: options.progressive,
-    });
+    const message: GenerateThumbnailMessage = {
+      operation: 'generateThumbnail',
+      input: typeof input === 'string' ? { type: 'path', value: input } : { type: 'buffer', value: input.toString('base64') },
+      options,
+      output,
+    };
 
-    await decoded.toFile(output);
+    await this.runGenerateThumbnailProcess(message);
   }
 
-  private async getImageDecodingPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    let pipeline = sharp(input, {
-      // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
-      failOn: options.processInvalidImages ? 'none' : 'error',
-      limitInputPixels: false,
-      raw: options.raw,
-      unlimited: true,
-    })
-      .pipelineColorspace(options.colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16')
-      .withIccProfile(options.colorspace);
+  private async runGenerateThumbnailProcess(message: GenerateThumbnailMessage): Promise<void> {
+    // eslint-disable-next-line unicorn/prefer-module
+    const workerPath = join(__dirname, '..', 'workers', 'sharp-thumbnail.worker.js');
 
-    if (!options.raw) {
-      const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
-      pipeline = pipeline.rotate(angle);
-      if (flip) {
-        pipeline = pipeline.flip();
-      }
+    const child = fork(workerPath, {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
 
-      if (flop) {
-        pipeline = pipeline.flop();
-      }
-    }
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
 
-    if (options.edits && options.edits.length > 0) {
-      pipeline = await this.applyEdits(pipeline, options.edits);
-    }
+      const cleanup = () => {
+        child.removeAllListeners('error');
+        child.removeAllListeners('exit');
+        child.removeAllListeners('message');
+      };
 
-    if (options.size !== undefined) {
-      pipeline = pipeline.resize(options.size, options.size, { fit: 'outside', withoutEnlargement: true });
-    }
-    return pipeline;
+      const finish = (error?: Error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      child.once('error', (error) => finish(error));
+      child.once('exit', (code, signal) => {
+        if (settled) {
+          return;
+        }
+
+        if (code === 0) {
+          finish();
+          return;
+        }
+
+        finish(new Error(`Thumbnail worker exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'})`));
+      });
+
+      child.once('message', (response: GenerateThumbnailResponse) => {
+        if (response.ok) {
+          finish();
+          return;
+        }
+
+        finish(new Error(`Thumbnail worker failed: ${response.error}`));
+      });
+
+      child.send(message, (error) => {
+        if (error) {
+          finish(error);
+        }
+      });
+    });
   }
 
   async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
-    const [{ rgbaToThumbHash }, decodingPipeline] = await Promise.all([
-      import('thumbhash'),
-      this.getImageDecodingPipeline(input, {
-        colorspace: options.colorspace,
-        processInvalidImages: options.processInvalidImages,
-        raw: options.raw,
-        edits: options.edits,
-      }),
-    ]);
+    const message: GenerateThumbhashMessage = {
+      operation: 'generateThumbhash',
+      input: typeof input === 'string' ? { type: 'path', value: input } : { type: 'buffer', value: input.toString('base64') },
+      options,
+    };
 
-    const pipeline = decodingPipeline.resize(100, 100, { fit: 'inside', withoutEnlargement: true }).raw().ensureAlpha();
+    const response = await this.runGenerateThumbhashProcess(message);
+    return Buffer.from(response.data, 'base64');
+  }
 
-    const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
+  private async runDecodeImageProcess(message: DecodeImageMessage): Promise<Extract<DecodeImageResponse, { ok: true }>> {
+    // eslint-disable-next-line unicorn/prefer-module
+    const workerPath = join(__dirname, '..', 'workers', 'sharp-thumbnail.worker.js');
 
-    return Buffer.from(rgbaToThumbHash(info.width, info.height, data));
+    const child = fork(workerPath, {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        child.removeAllListeners('error');
+        child.removeAllListeners('exit');
+        child.removeAllListeners('message');
+      };
+
+      const finish = (error?: Error, response?: Extract<DecodeImageResponse, { ok: true }>) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(response as Extract<DecodeImageResponse, { ok: true }>);
+      };
+
+      child.once('error', (error) => finish(error));
+      child.once('exit', (code, signal) => {
+        if (settled) {
+          return;
+        }
+
+        if (code === 0) {
+          finish(new Error('Decode worker exited before returning a response'));
+          return;
+        }
+
+        finish(new Error(`Decode worker exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'})`));
+      });
+
+      child.once('message', (response: DecodeImageResponse) => {
+        if (response.ok) {
+          finish(undefined, response);
+          return;
+        }
+
+        finish(new Error(`Decode worker failed: ${response.error}`));
+      });
+
+      child.send(message, (error) => {
+        if (error) {
+          finish(error);
+        }
+      });
+    });
+  }
+
+  private async runGenerateThumbhashProcess(
+    message: GenerateThumbhashMessage,
+  ): Promise<Extract<GenerateThumbhashResponse, { ok: true }>> {
+    // eslint-disable-next-line unicorn/prefer-module
+    const workerPath = join(__dirname, '..', 'workers', 'sharp-thumbnail.worker.js');
+
+    const child = fork(workerPath, {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        child.removeAllListeners('error');
+        child.removeAllListeners('exit');
+        child.removeAllListeners('message');
+      };
+
+      const finish = (error?: Error, response?: Extract<GenerateThumbhashResponse, { ok: true }>) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(response as Extract<GenerateThumbhashResponse, { ok: true }>);
+      };
+
+      child.once('error', (error) => finish(error));
+      child.once('exit', (code, signal) => {
+        if (settled) {
+          return;
+        }
+
+        if (code === 0) {
+          finish(new Error('Thumbhash worker exited before returning a response'));
+          return;
+        }
+
+        finish(new Error(`Thumbhash worker exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'})`));
+      });
+
+      child.once('message', (response: GenerateThumbhashResponse) => {
+        if (response.ok) {
+          finish(undefined, response);
+          return;
+        }
+
+        finish(new Error(`Thumbhash worker failed: ${response.error}`));
+      });
+
+      child.send(message, (error) => {
+        if (error) {
+          finish(error);
+        }
+      });
+    });
   }
 
   async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {
@@ -313,8 +488,85 @@ export class MediaRepository {
   }
 
   async getImageMetadata(input: string | Buffer): Promise<ImageDimensions & { isTransparent: boolean }> {
-    const { width = 0, height = 0, hasAlpha = false } = await sharp(input).metadata();
-    return { width, height, isTransparent: hasAlpha };
+    const message: GetImageMetadataMessage = {
+      operation: 'getImageMetadata',
+      input: typeof input === 'string' ? { type: 'path', value: input } : { type: 'buffer', value: input.toString('base64') },
+    };
+
+    const response = await this.runGetImageMetadataProcess(message);
+    return {
+      width: response.width,
+      height: response.height,
+      isTransparent: response.isTransparent,
+    };
+  }
+
+  private async runGetImageMetadataProcess(
+    message: GetImageMetadataMessage,
+  ): Promise<Extract<GetImageMetadataResponse, { ok: true }>> {
+    // eslint-disable-next-line unicorn/prefer-module
+    const workerPath = join(__dirname, '..', 'workers', 'sharp-thumbnail.worker.js');
+
+    const child = fork(workerPath, {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        child.removeAllListeners('error');
+        child.removeAllListeners('exit');
+        child.removeAllListeners('message');
+      };
+
+      const finish = (error?: Error, response?: Extract<GetImageMetadataResponse, { ok: true }>) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(response as Extract<GetImageMetadataResponse, { ok: true }>);
+      };
+
+      child.once('error', (error) => finish(error));
+      child.once('exit', (code, signal) => {
+        if (settled) {
+          return;
+        }
+
+        if (code === 0) {
+          finish(new Error('Image metadata worker exited before returning a response'));
+          return;
+        }
+
+        finish(
+          new Error(`Image metadata worker exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'})`),
+        );
+      });
+
+      child.once('message', (response: GetImageMetadataResponse) => {
+        if (response.ok) {
+          finish(undefined, response);
+          return;
+        }
+
+        finish(new Error(`Image metadata worker failed: ${response.error}`));
+      });
+
+      child.send(message, (error) => {
+        if (error) {
+          finish(error);
+        }
+      });
+    });
   }
 
   private configureFfmpegCall(input: string, output: string | Writable, options: TranscodeCommand) {
