@@ -290,7 +290,7 @@ const getEnv = (): EnvData => {
         defaultJobOptions: {
           attempts: 1,
           removeOnComplete: true,
-          removeOnFail: false,
+          removeOnFail: dto.IMMICH_REMOVE_ON_FAIL ?? true,
         },
       },
       queues: Object.values(QueueName).map((name) => ({ name })),

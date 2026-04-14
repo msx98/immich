@@ -57,6 +57,9 @@ export class EnvDto {
   @ValidateBoolean({ optional: true })
   IMMICH_IGNORE_MOUNT_CHECK_ERRORS?: boolean;
 
+  @ValidateBoolean({ optional: true })
+  IMMICH_REMOVE_ON_FAIL?: boolean;
+
   @IsEnum(LogLevel)
   @Optional()
   IMMICH_LOG_LEVEL?: LogLevel;
