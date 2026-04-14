@@ -288,8 +288,12 @@ export class MediaRepository {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const timer = setTimeout(() => {
+        finish(new Error('Decode worker timed out waiting for a response'));
+      }, 30_000);
 
       const cleanup = () => {
+        clearTimeout(timer);
         child.removeAllListeners('error');
         child.removeAllListeners('exit');
         child.removeAllListeners('message');
@@ -318,7 +322,10 @@ export class MediaRepository {
         }
 
         if (code === 0) {
-          finish(new Error('Decode worker exited before returning a response'));
+          return;
+        }
+
+        if (code === null && signal === null) {
           return;
         }
 
@@ -354,8 +361,12 @@ export class MediaRepository {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const timer = setTimeout(() => {
+        finish(new Error('Thumbhash worker timed out waiting for a response'));
+      }, 30_000);
 
       const cleanup = () => {
+        clearTimeout(timer);
         child.removeAllListeners('error');
         child.removeAllListeners('exit');
         child.removeAllListeners('message');
@@ -384,7 +395,10 @@ export class MediaRepository {
         }
 
         if (code === 0) {
-          finish(new Error('Thumbhash worker exited before returning a response'));
+          return;
+        }
+
+        if (code === null && signal === null) {
           return;
         }
 
@@ -513,8 +527,12 @@ export class MediaRepository {
 
     return new Promise((resolve, reject) => {
       let settled = false;
+      const timer = setTimeout(() => {
+        finish(new Error('Image metadata worker timed out waiting for a response'));
+      }, 30_000);
 
       const cleanup = () => {
+        clearTimeout(timer);
         child.removeAllListeners('error');
         child.removeAllListeners('exit');
         child.removeAllListeners('message');
@@ -543,7 +561,10 @@ export class MediaRepository {
         }
 
         if (code === 0) {
-          finish(new Error('Image metadata worker exited before returning a response'));
+          return;
+        }
+
+        if (code === null && signal === null) {
           return;
         }
 

@@ -106,16 +106,27 @@ const getImageDecodingPipeline = async (input: string | Buffer, options: DecodeT
     return pipeline;
 };
 
-const send = (response: WorkerResponse) => {
-    if (typeof process.send === 'function') {
-        process.send(response);
-    }
-};
+const send = (response: WorkerResponse): Promise<void> =>
+    new Promise((resolve, reject) => {
+        if (typeof process.send !== 'function') {
+            resolve();
+            return;
+        }
+
+        process.send(response, (error) => {
+            if (error) {
+                reject(error);
+                return;
+            }
+
+            resolve();
+        });
+    });
 
 const resolveInput = (message: WorkerInput) =>
     message.input.type === 'path' ? message.input.value : Buffer.from(message.input.value, 'base64');
 
-const runGenerateThumbnail = async (message: GenerateThumbnailMessage) => {
+const runGenerateThumbnail = async (message: GenerateThumbnailMessage): Promise<WorkerResponse> => {
     const input = resolveInput(message);
     const pipeline = await getImageDecodingPipeline(input, message.options);
     const output = pipeline.toFormat(message.options.format, {
@@ -125,15 +136,15 @@ const runGenerateThumbnail = async (message: GenerateThumbnailMessage) => {
     });
 
     await output.toFile(message.output);
-    send({ ok: true });
+    return { ok: true };
 };
 
-const runDecodeImage = async (message: DecodeImageMessage) => {
+const runDecodeImage = async (message: DecodeImageMessage): Promise<WorkerResponse> => {
     const input = resolveInput(message);
     const pipeline = await getImageDecodingPipeline(input, message.options);
     const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
 
-    send({
+    return {
         ok: true,
         data: data.toString('base64'),
         info: {
@@ -141,10 +152,10 @@ const runDecodeImage = async (message: DecodeImageMessage) => {
             height: info.height,
             channels: info.channels as 1 | 2 | 3 | 4,
         },
-    });
+    };
 };
 
-const runGenerateThumbhash = async (message: GenerateThumbhashMessage) => {
+const runGenerateThumbhash = async (message: GenerateThumbhashMessage): Promise<WorkerResponse> => {
     const { rgbaToThumbHash } = await import('thumbhash');
     const input = resolveInput(message);
     const pipeline = await getImageDecodingPipeline(input, {
@@ -155,30 +166,36 @@ const runGenerateThumbhash = async (message: GenerateThumbhashMessage) => {
     });
 
     const { data, info } = await pipeline.resize(100, 100, { fit: 'inside', withoutEnlargement: true }).raw().ensureAlpha().toBuffer({ resolveWithObject: true });
-    send({ ok: true, data: Buffer.from(rgbaToThumbHash(info.width, info.height, data)).toString('base64') });
+    return { ok: true, data: Buffer.from(rgbaToThumbHash(info.width, info.height, data)).toString('base64') };
 };
 
-const runGetImageMetadata = async (message: GetImageMetadataMessage) => {
+const runGetImageMetadata = async (message: GetImageMetadataMessage): Promise<WorkerResponse> => {
     const input = resolveInput(message);
     const { width = 0, height = 0, hasAlpha = false } = await sharp(input).metadata();
-    send({ ok: true, width, height, isTransparent: hasAlpha });
+    return { ok: true, width, height, isTransparent: hasAlpha };
 };
 
 process.once('message', async (message: WorkerMessage) => {
     try {
+        let response: WorkerResponse;
         if (message.operation === 'generateThumbnail') {
-            await runGenerateThumbnail(message);
+            response = await runGenerateThumbnail(message);
         } else if (message.operation === 'decodeImage') {
-            await runDecodeImage(message);
+            response = await runDecodeImage(message);
         } else if (message.operation === 'getImageMetadata') {
-            await runGetImageMetadata(message);
+            response = await runGetImageMetadata(message);
         } else {
-            await runGenerateThumbhash(message);
+            response = await runGenerateThumbhash(message);
         }
 
+        await send(response);
         process.exit(0);
     } catch (error: Error | any) {
-        send({ ok: false, error: error?.stack || error?.message || String(error) });
+        try {
+            await send({ ok: false, error: error?.stack || error?.message || String(error) });
+        } catch {
+            // best effort error reporting over IPC
+        }
         process.exit(1);
     }
 });
