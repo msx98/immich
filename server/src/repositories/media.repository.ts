@@ -1,22 +1,20 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { ExifDateTime, exiftool, WriteTags } from 'exiftool-vendored';
 import ffmpeg, { FfprobeData, FfprobeStream } from 'fluent-ffmpeg';
 import _ from 'lodash';
 import { Duration } from 'luxon';
-import { execFile as execFileCb } from 'node:child_process';
+import { ChildProcess, execFile as execFileCb } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { Writable } from 'node:stream';
 import { promisify } from 'node:util';
-import sharp from 'sharp';
-import { ORIENTATION_TO_SHARP_ROTATION } from 'src/constants';
 import { Exif } from 'src/database';
-import { AssetEditActionItem } from 'src/dtos/editing.dto';
 import {
   AacProfile,
   Av1Profile,
   ColorMatrix,
   ColorPrimaries,
-  Colorspace,
   ColorTransfer,
   DvProfile,
   DvSignalCompatibility,
@@ -26,6 +24,7 @@ import {
   RawExtractedFormat,
 } from 'src/enum';
 import { LoggingRepository } from 'src/repositories/logging.repository';
+import { ProcessRepository } from 'src/repositories/process.repository';
 import {
   DecodeToBufferOptions,
   GenerateThumbhashOptions,
@@ -37,7 +36,21 @@ import {
   VideoPacketInfo,
 } from 'src/types';
 import { handlePromiseError } from 'src/utils/misc';
-import { createAffineMatrix } from 'src/utils/transform';
+import {
+  DecodeImageMessage,
+  DecodeImageResponse,
+  GenerateThumbhashMessage,
+  GenerateThumbhashResponse,
+  GenerateThumbnailMessage,
+  GenerateThumbnailResponse,
+  GetImageMetadataMessage,
+  GetImageMetadataResponse,
+  SHARP_WORKER_MAX_CONSECUTIVE_TIMEOUTS,
+  SHARP_WORKER_TIMEOUT_MS,
+  SharpWorkerMessage,
+  SharpWorkerResponse,
+  toWorkerInput,
+} from 'src/workers/sharp-thumbnail.protocol';
 
 const probe = (input: string, options: string[]): Promise<FfprobeData> =>
   new Promise((resolve, reject) =>
@@ -46,10 +59,149 @@ const probe = (input: string, options: string[]): Promise<FfprobeData> =>
 
 const execFile = promisify(execFileCb);
 
-sharp.concurrency(0);
-sharp.cache({ files: 0 });
-
 const pascalCase = (str: string) => _.upperFirst(_.camelCase(str.toLowerCase()));
+
+/**
+ * A single, long-lived thumbnail-generation process shared by every sharp call in this
+ * repository. All requests are multiplexed onto one child over IPC (matching how sharp calls
+ * used to run concurrently in-process, e.g. via the ThumbnailGeneration job queue's concurrency
+ * setting) — the difference is that a native libvips/sharp crash now only takes down this one
+ * worker process, which is transparently respawned on the next call, instead of crashing the
+ * entire server/microservices process.
+ */
+class SharpWorkerClient {
+  private child: ChildProcess | null = null;
+  private consecutiveTimeouts = 0;
+  private readonly pending = new Map<
+    string,
+    {
+      resolve: (response: Extract<SharpWorkerResponse, { ok: true }>) => void;
+      reject: (error: Error) => void;
+      timer: NodeJS.Timeout;
+    }
+  >();
+
+  constructor(
+    private processRepository: ProcessRepository,
+    private logger: LoggingRepository,
+  ) {}
+
+  send<M extends SharpWorkerMessage, R extends SharpWorkerResponse>(
+    message: Omit<M, 'requestId'>,
+    timeoutMs = SHARP_WORKER_TIMEOUT_MS,
+  ): Promise<Extract<R, { ok: true }>> {
+    const requestId = randomUUID();
+    const child = this.ensureChild();
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this.onTimeout(requestId), timeoutMs);
+      this.pending.set(requestId, {
+        resolve: resolve as (response: Extract<SharpWorkerResponse, { ok: true }>) => void,
+        reject,
+        timer,
+      });
+
+      child.send({ ...message, requestId }, (error) => {
+        if (error && this.pending.delete(requestId)) {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
+    });
+  }
+
+  /** Kills the current worker (if any) so future calls spawn a fresh one; used on graceful app shutdown. */
+  shutdown() {
+    if (this.child) {
+      this.child.kill('SIGTERM');
+      this.child = null;
+    }
+  }
+
+  private onTimeout(requestId: string) {
+    const request = this.pending.get(requestId);
+    if (!request) {
+      return;
+    }
+    this.pending.delete(requestId);
+    request.reject(new Error('Thumbnail worker timed out waiting for a response'));
+
+    this.consecutiveTimeouts++;
+    if (this.consecutiveTimeouts < SHARP_WORKER_MAX_CONSECUTIVE_TIMEOUTS) {
+      return;
+    }
+
+    // Several timeouts in a row suggest the worker process itself is stuck (e.g. an infinite
+    // loop in libvips), not just one slow image — proactively cycle it rather than waiting
+    // for it to either finish or crash on its own.
+    this.consecutiveTimeouts = 0;
+    if (this.child) {
+      this.logger.warn(
+        `Thumbnail worker had ${SHARP_WORKER_MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts; restarting it`,
+      );
+      this.child.kill('SIGTERM');
+      this.child = null;
+    }
+  }
+
+  private ensureChild(): ChildProcess {
+    if (this.child) {
+      return this.child;
+    }
+
+    // eslint-disable-next-line unicorn/prefer-module
+    const workerPath = join(dirname(__filename), '..', 'workers', 'sharp-thumbnail.worker.js');
+    const child = this.processRepository.fork(workerPath, [], {
+      // avoid every forked worker trying to bind the same debugger inspect port
+      execArgv: process.execArgv.filter((arg) => !arg.startsWith('--inspect')),
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    this.child = child;
+
+    child.on('message', (response: SharpWorkerResponse) => {
+      this.consecutiveTimeouts = 0;
+      const request = this.pending.get(response.requestId);
+      if (!request) {
+        return;
+      }
+      this.pending.delete(response.requestId);
+      clearTimeout(request.timer);
+      if (response.ok) {
+        request.resolve(response as Extract<SharpWorkerResponse, { ok: true }>);
+      } else {
+        request.reject(new Error(`Thumbnail worker failed: ${response.error}`));
+      }
+    });
+
+    const onChildDeath = (error: Error) => {
+      if (this.child === child) {
+        // next call lazily spawns a fresh worker
+        this.child = null;
+      }
+
+      // any request already in flight to this (now-dead) child can never be answered
+      for (const [requestId, request] of this.pending) {
+        clearTimeout(request.timer);
+        request.reject(error);
+        this.pending.delete(requestId);
+      }
+    };
+
+    child.once('error', (error) => onChildDeath(error));
+    child.once('exit', (code, signal) => {
+      if (code === 0) {
+        return;
+      }
+      onChildDeath(
+        new Error(
+          `Thumbnail worker process exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'}); it will be restarted for subsequent requests`,
+        ),
+      );
+    });
+
+    return child;
+  }
+}
 
 type ProgressEvent = {
   frames: number;
@@ -66,10 +218,22 @@ export type ExtractResult = {
 };
 
 @Injectable()
-export class MediaRepository {
-  constructor(private logger: LoggingRepository) {
+export class MediaRepository implements OnModuleDestroy {
+  private readonly sharpWorker: SharpWorkerClient;
+
+  constructor(
+    private logger: LoggingRepository,
+    private processRepository: ProcessRepository,
+  ) {
     this.logger.setContext(MediaRepository.name);
+    this.sharpWorker = new SharpWorkerClient(this.processRepository, this.logger);
   }
+
+  onModuleDestroy() {
+    // avoid leaving an orphaned thumbnail worker process behind when the server shuts down
+    this.sharpWorker.shutdown();
+  }
+
 
   /**
    *
@@ -148,92 +312,31 @@ export class MediaRepository {
     }
   }
 
-  decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
-  }
-
-  private applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): sharp.Sharp {
-    const crop = edits.find((edit) => edit.action === 'crop');
-    if (crop) {
-      pipeline = pipeline.extract({
-        left: Math.round(crop.parameters.x),
-        top: Math.round(crop.parameters.y),
-        width: Math.round(crop.parameters.width),
-        height: Math.round(crop.parameters.height),
-      });
-    }
-
-    const affineEditOperations = edits.filter((edit) => edit.action !== 'crop');
-    if (affineEditOperations.length > 0) {
-      const { a, b, c, d } = createAffineMatrix(affineEditOperations);
-      pipeline = pipeline.affine([
-        [a, b],
-        [c, d],
-      ]);
-    }
-
-    return pipeline;
+  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
+    const response = await this.sharpWorker.send<DecodeImageMessage, DecodeImageResponse>({
+      operation: 'decodeImage',
+      input: toWorkerInput(input),
+      options,
+    });
+    return { data: Buffer.from(response.data, 'base64'), info: response.info };
   }
 
   async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    await this.getImageDecodingPipeline(input, options)
-      .toFormat(options.format, {
-        quality: options.quality,
-        // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
-        chromaSubsampling: options.quality >= 80 ? '4:4:4' : '4:2:0',
-        progressive: options.progressive,
-      })
-      .toFile(output);
-  }
-
-  private getImageDecodingPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    let pipeline = sharp(input, {
-      // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
-      failOn: options.processInvalidImages ? 'none' : 'error',
-      limitInputPixels: false,
-      raw: options.raw,
-      unlimited: true,
-    })
-      .pipelineColorspace(options.colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16')
-      .withIccProfile(options.colorspace);
-
-    if (!options.raw) {
-      const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
-      pipeline = pipeline.rotate(angle);
-      if (flip) {
-        pipeline = pipeline.flip();
-      }
-
-      if (flop) {
-        pipeline = pipeline.flop();
-      }
-    }
-
-    if (options.edits && options.edits.length > 0) {
-      pipeline = this.applyEdits(pipeline, options.edits);
-    }
-
-    if (options.size !== undefined) {
-      pipeline = pipeline.resize(options.size, options.size, { fit: 'outside', withoutEnlargement: true });
-    }
-    return pipeline;
+    await this.sharpWorker.send<GenerateThumbnailMessage, GenerateThumbnailResponse>({
+      operation: 'generateThumbnail',
+      input: toWorkerInput(input),
+      options,
+      output,
+    });
   }
 
   async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
-    const { rgbaToThumbHash } = await import('thumbhash');
-
-    const { data, info } = await this.getImageDecodingPipeline(input, {
-      colorspace: options.colorspace,
-      processInvalidImages: options.processInvalidImages,
-      raw: options.raw,
-      edits: options.edits,
-    })
-      .resize(100, 100, { fit: 'inside', withoutEnlargement: true })
-      .raw()
-      .ensureAlpha()
-      .toBuffer({ resolveWithObject: true });
-
-    return Buffer.from(rgbaToThumbHash(info.width, info.height, data));
+    const response = await this.sharpWorker.send<GenerateThumbhashMessage, GenerateThumbhashResponse>({
+      operation: 'generateThumbhash',
+      input: toWorkerInput(input),
+      options,
+    });
+    return Buffer.from(response.data, 'base64');
   }
 
   async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {
@@ -387,8 +490,11 @@ export class MediaRepository {
   }
 
   async getImageMetadata(input: string | Buffer): Promise<ImageDimensions & { isTransparent: boolean }> {
-    const { width = 0, height = 0, hasAlpha = false } = await sharp(input).metadata();
-    return { width, height, isTransparent: hasAlpha };
+    const response = await this.sharpWorker.send<GetImageMetadataMessage, GetImageMetadataResponse>({
+      operation: 'getImageMetadata',
+      input: toWorkerInput(input),
+    });
+    return { width: response.width, height: response.height, isTransparent: response.isTransparent };
   }
 
   private configureFfmpegCall(input: string, output: string | Writable, options: TranscodeCommand) {
