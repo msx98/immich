@@ -3,20 +3,17 @@ import { ExifDateTime, exiftool, WriteTags } from 'exiftool-vendored';
 import ffmpeg, { FfprobeData, FfprobeStream } from 'fluent-ffmpeg';
 import _ from 'lodash';
 import { Duration } from 'luxon';
-import { execFile as execFileCb } from 'node:child_process';
+import { fork, execFile as execFileCb } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { promisify } from 'node:util';
-import sharp from 'sharp';
-import { ORIENTATION_TO_SHARP_ROTATION } from 'src/constants';
 import { Exif } from 'src/database';
-import { AssetEditActionItem } from 'src/dtos/editing.dto';
 import {
   AacProfile,
   Av1Profile,
   ColorMatrix,
   ColorPrimaries,
-  Colorspace,
   ColorTransfer,
   DvProfile,
   DvSignalCompatibility,
@@ -37,7 +34,6 @@ import {
   VideoPacketInfo,
 } from 'src/types';
 import { handlePromiseError } from 'src/utils/misc';
-import { createAffineMatrix } from 'src/utils/transform';
 
 const probe = (input: string, options: string[]): Promise<FfprobeData> =>
   new Promise((resolve, reject) =>
@@ -46,10 +42,109 @@ const probe = (input: string, options: string[]): Promise<FfprobeData> =>
 
 const execFile = promisify(execFileCb);
 
-sharp.concurrency(0);
-sharp.cache({ files: 0 });
-
 const pascalCase = (str: string) => _.upperFirst(_.camelCase(str.toLowerCase()));
+
+type WorkerInputRef = { type: 'path'; value: string } | { type: 'buffer'; value: string };
+
+const toWorkerInput = (input: string | Buffer): WorkerInputRef =>
+  typeof input === 'string' ? { type: 'path', value: input } : { type: 'buffer', value: input.toString('base64') };
+
+type GenerateThumbnailMessage = {
+  operation: 'generateThumbnail';
+  input: WorkerInputRef;
+  options: GenerateThumbnailOptions;
+  output: string;
+};
+
+type GenerateThumbnailResponse = { ok: true } | { ok: false; error: string };
+
+type DecodeImageMessage = {
+  operation: 'decodeImage';
+  input: WorkerInputRef;
+  options: DecodeToBufferOptions;
+};
+
+type DecodeImageResponse =
+  | { ok: true; data: string; info: { width: number; height: number; channels: 1 | 2 | 3 | 4 } }
+  | { ok: false; error: string };
+
+type GenerateThumbhashMessage = {
+  operation: 'generateThumbhash';
+  input: WorkerInputRef;
+  options: GenerateThumbhashOptions;
+};
+
+type GenerateThumbhashResponse = { ok: true; data: string } | { ok: false; error: string };
+
+type GetImageMetadataMessage = {
+  operation: 'getImageMetadata';
+  input: WorkerInputRef;
+};
+
+type GetImageMetadataResponse =
+  | { ok: true; width: number; height: number; isTransparent: boolean }
+  | { ok: false; error: string };
+
+const SHARP_WORKER_TIMEOUT_MS = 30_000;
+
+/** Runs a single sharp operation in a short-lived forked child process, so a native
+ * libvips/sharp crash (segfault) on a malformed image kills only the child, not the server. */
+function runSharpWorker<M, R extends { ok: boolean }>(
+  message: M,
+  timeoutMs = SHARP_WORKER_TIMEOUT_MS,
+): Promise<Extract<R, { ok: true }>> {
+  // eslint-disable-next-line unicorn/prefer-module
+  const workerPath = join(__dirname, '..', 'workers', 'sharp-thumbnail.worker.js');
+  const child = fork(workerPath, { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error('Sharp worker timed out waiting for a response')), timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeAllListeners('error');
+      child.removeAllListeners('exit');
+      child.removeAllListeners('message');
+      if (!child.killed) {
+        child.kill();
+      }
+    };
+
+    const finish = (error?: Error, response?: Extract<R, { ok: true }>) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(response as Extract<R, { ok: true }>);
+    };
+
+    child.once('error', (error) => finish(error));
+    child.once('exit', (code, signal) => {
+      if (settled || code === 0 || (code === null && signal === null)) {
+        return;
+      }
+      finish(new Error(`Sharp worker exited unexpectedly (code: ${code ?? 'null'}, signal: ${signal ?? 'none'})`));
+    });
+    child.once('message', (response: R) => {
+      if (response.ok) {
+        finish(undefined, response as Extract<R, { ok: true }>);
+        return;
+      }
+      finish(new Error(`Sharp worker failed: ${(response as { error: string }).error}`));
+    });
+    child.send(message as object, (error) => {
+      if (error) {
+        finish(error);
+      }
+    });
+  });
+}
 
 type ProgressEvent = {
   frames: number;
@@ -148,92 +243,26 @@ export class MediaRepository {
     }
   }
 
-  decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
-    return this.getImageDecodingPipeline(input, options).raw().toBuffer({ resolveWithObject: true });
-  }
-
-  private applyEdits(pipeline: sharp.Sharp, edits: AssetEditActionItem[]): sharp.Sharp {
-    const crop = edits.find((edit) => edit.action === 'crop');
-    if (crop) {
-      pipeline = pipeline.extract({
-        left: Math.round(crop.parameters.x),
-        top: Math.round(crop.parameters.y),
-        width: Math.round(crop.parameters.width),
-        height: Math.round(crop.parameters.height),
-      });
-    }
-
-    const affineEditOperations = edits.filter((edit) => edit.action !== 'crop');
-    if (affineEditOperations.length > 0) {
-      const { a, b, c, d } = createAffineMatrix(affineEditOperations);
-      pipeline = pipeline.affine([
-        [a, b],
-        [c, d],
-      ]);
-    }
-
-    return pipeline;
+  async decodeImage(input: string | Buffer, options: DecodeToBufferOptions) {
+    const message: DecodeImageMessage = { operation: 'decodeImage', input: toWorkerInput(input), options };
+    const response = await runSharpWorker<DecodeImageMessage, DecodeImageResponse>(message);
+    return { data: Buffer.from(response.data, 'base64'), info: response.info };
   }
 
   async generateThumbnail(input: string | Buffer, options: GenerateThumbnailOptions, output: string): Promise<void> {
-    await this.getImageDecodingPipeline(input, options)
-      .toFormat(options.format, {
-        quality: options.quality,
-        // this is default in libvips (except the threshold is 90), but we need to set it manually in sharp
-        chromaSubsampling: options.quality >= 80 ? '4:4:4' : '4:2:0',
-        progressive: options.progressive,
-      })
-      .toFile(output);
-  }
-
-  private getImageDecodingPipeline(input: string | Buffer, options: DecodeToBufferOptions) {
-    let pipeline = sharp(input, {
-      // some invalid images can still be processed by sharp, but we want to fail on them by default to avoid crashes
-      failOn: options.processInvalidImages ? 'none' : 'error',
-      limitInputPixels: false,
-      raw: options.raw,
-      unlimited: true,
-    })
-      .pipelineColorspace(options.colorspace === Colorspace.Srgb ? 'srgb' : 'rgb16')
-      .withIccProfile(options.colorspace);
-
-    if (!options.raw) {
-      const { angle, flip, flop } = options.orientation ? ORIENTATION_TO_SHARP_ROTATION[options.orientation] : {};
-      pipeline = pipeline.rotate(angle);
-      if (flip) {
-        pipeline = pipeline.flip();
-      }
-
-      if (flop) {
-        pipeline = pipeline.flop();
-      }
-    }
-
-    if (options.edits && options.edits.length > 0) {
-      pipeline = this.applyEdits(pipeline, options.edits);
-    }
-
-    if (options.size !== undefined) {
-      pipeline = pipeline.resize(options.size, options.size, { fit: 'outside', withoutEnlargement: true });
-    }
-    return pipeline;
+    const message: GenerateThumbnailMessage = {
+      operation: 'generateThumbnail',
+      input: toWorkerInput(input),
+      options,
+      output,
+    };
+    await runSharpWorker<GenerateThumbnailMessage, GenerateThumbnailResponse>(message);
   }
 
   async generateThumbhash(input: string | Buffer, options: GenerateThumbhashOptions): Promise<Buffer> {
-    const { rgbaToThumbHash } = await import('thumbhash');
-
-    const { data, info } = await this.getImageDecodingPipeline(input, {
-      colorspace: options.colorspace,
-      processInvalidImages: options.processInvalidImages,
-      raw: options.raw,
-      edits: options.edits,
-    })
-      .resize(100, 100, { fit: 'inside', withoutEnlargement: true })
-      .raw()
-      .ensureAlpha()
-      .toBuffer({ resolveWithObject: true });
-
-    return Buffer.from(rgbaToThumbHash(info.width, info.height, data));
+    const message: GenerateThumbhashMessage = { operation: 'generateThumbhash', input: toWorkerInput(input), options };
+    const response = await runSharpWorker<GenerateThumbhashMessage, GenerateThumbhashResponse>(message);
+    return Buffer.from(response.data, 'base64');
   }
 
   async probe(input: string, options?: ProbeOptions): Promise<VideoInfo> {
@@ -387,8 +416,9 @@ export class MediaRepository {
   }
 
   async getImageMetadata(input: string | Buffer): Promise<ImageDimensions & { isTransparent: boolean }> {
-    const { width = 0, height = 0, hasAlpha = false } = await sharp(input).metadata();
-    return { width, height, isTransparent: hasAlpha };
+    const message: GetImageMetadataMessage = { operation: 'getImageMetadata', input: toWorkerInput(input) };
+    const response = await runSharpWorker<GetImageMetadataMessage, GetImageMetadataResponse>(message);
+    return { width: response.width, height: response.height, isTransparent: response.isTransparent };
   }
 
   private configureFfmpegCall(input: string, output: string | Writable, options: TranscodeCommand) {
