@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import sharp from 'sharp';
 import { ORIENTATION_TO_SHARP_ROTATION } from 'src/constants';
 import { AssetEditActionItem } from 'src/dtos/editing.dto';
@@ -110,7 +113,34 @@ const runGenerateThumbnail = async (message: GenerateThumbnailMessage): Promise<
     progressive: message.options.progressive,
   });
 
-  await output.toFile(message.output);
+  const finalPath = message.output;
+  // Same directory as the final path so the rename below is a same-filesystem, atomic POSIX
+  // rename() rather than a cross-filesystem copy — readers only ever see the old complete file
+  // or the new complete file, never a partially-written one (e.g. from a mid-write crash).
+  const tempDir = dirname(finalPath);
+  const tempPrefix = `.${basename(finalPath)}.tmp-`;
+  const tempPath = join(tempDir, `${tempPrefix}${randomUUID()}`);
+
+  // Best-effort cleanup of any stray temp file left behind by a worker that crashed mid-write
+  // during a previous attempt at this same output path (a real native crash bypasses the
+  // catch block below entirely, so that attempt's temp file is never cleaned up there).
+  try {
+    const entries = await fs.readdir(tempDir);
+    await Promise.all(
+      entries.filter((entry) => entry.startsWith(tempPrefix)).map((entry) => fs.rm(join(tempDir, entry), { force: true })),
+    );
+  } catch {
+    // best effort; a missing/unreadable directory here will surface as a real error on the write below anyway
+  }
+
+  try {
+    await output.toFile(tempPath);
+    await fs.rename(tempPath, finalPath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+
   return { ok: true };
 };
 
